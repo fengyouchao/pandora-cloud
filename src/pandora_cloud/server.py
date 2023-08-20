@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from os import getenv
 from os.path import join, abspath, dirname
 
@@ -20,7 +20,7 @@ from . import __version__
 class ChatBot:
     __default_ip = '127.0.0.1'
     __default_port = 8018
-    __build_id = 'cx416mT2Lb0ZTj5FxFg1l'
+    __build_id = 'oDTsXIohP85MnLZj7TlaB'
 
     def __init__(self, proxy, debug=False, sentry=False, login_local=False):
         self.proxy = proxy
@@ -28,12 +28,11 @@ class ChatBot:
         self.sentry = sentry
         self.login_local = login_local
         self.log_level = logging.DEBUG if debug else logging.WARN
-        self.api_prefix = getenv('CHATGPT_API_PREFIX', 'https://ai.fakeopen.com')
 
         hook_logging(level=self.log_level, format='[%(asctime)s] %(levelname)s in %(module)s: %(message)s')
         self.logger = logging.getLogger('waitress')
 
-    def run(self, bind_str, threads=8):
+    def run(self, bind_str, threads=8, listen=True):
         host, port = self.__parse_bind(bind_str)
 
         resource_path = abspath(join(dirname(__file__), 'flask'))
@@ -42,9 +41,12 @@ class ChatBot:
                     template_folder=join(resource_path, 'templates'))
         app.wsgi_app = ProxyFix(app.wsgi_app, x_port=1)
         app.after_request(self.__after_request)
+        app.register_error_handler(404, self.error404)
 
         app.route('/api/auth/session')(self.session)
         app.route('/api/accounts/check/v4-2023-04-27')(self.check)
+        app.route('/api/auth/csrf')(self.csrf)
+        app.route('/api/auth/signout', methods=['POST'])(self.sign_out)
         app.route('/auth/logout')(self.logout)
         app.route('/_next/data/{}/index.json'.format(self.__build_id))(self.chat_info)
         app.route('/_next/data/{}/c/<conversation_id>.json'.format(self.__build_id))(self.chat_info)
@@ -62,6 +64,7 @@ class ChatBot:
         app.route('/chat/<conversation_id>')(self.chat_index)
 
         app.route('/auth/login')(self.login)
+        app.route('/auth/login_share')(self.login_share_token)
         app.route('/auth/login', methods=['POST'])(self.login_post)
         app.route('/auth/login_token', methods=['POST'])(self.login_token)
 
@@ -69,7 +72,10 @@ class ChatBot:
             self.logger.warning('Serving on http://{}:{}'.format(host, port))
 
         WSGIRequestHandler.protocol_version = 'HTTP/1.1'
-        serve(app, host=host, port=port, ident=None, threads=threads)
+        if listen:
+            serve(app, host=host, port=port, ident=None, threads=threads)
+
+        return app
 
     @staticmethod
     def __after_request(resp):
@@ -88,14 +94,22 @@ class ChatBot:
         return sections[0], int(sections[1])
 
     @staticmethod
+    def __get_api_prefix():
+        default = 'https://ai-{}.fakeopen.com'.format((datetime.now() - timedelta(days=1)).strftime('%Y%m%d'))
+        return getenv('CHATGPT_API_PREFIX', default)
+
+    @staticmethod
     def __set_cookie(resp, token, expires):
         resp.set_cookie('access-token', token, expires=expires, path='/', domain=None, httponly=True, samesite='Lax')
 
-    @staticmethod
-    async def __get_userinfo():
+    async def __get_userinfo(self):
         access_token = request.cookies.get('access-token')
         try:
             payload = check_access_token(access_token)
+            if True == payload:
+                ti = await self.__fetch_share_tokeninfo(access_token)
+                return False, ti['user_id'], ti['email'], access_token, {'exp': ti['expire_at']}
+
             if 'https://api.openai.com/auth' not in payload or 'https://api.openai.com/profile' not in payload:
                 raise Exception('invalid access token')
         except:
@@ -106,8 +120,21 @@ class ChatBot:
 
         return False, user_id, email, access_token, payload
 
+    async def __fetch_share_tokeninfo(self, share_token):
+        url = self.__get_api_prefix() + '/token/info/{}'.format(share_token)
+
+        async with httpx.AsyncClient(proxies=self.proxy, timeout=30) as client:
+            response = await client.get(url)
+            if response.status_code == 404:
+                raise Exception('share token not found or expired')
+
+            if response.status_code != 200:
+                raise Exception('failed to fetch share token info')
+
+            return response.json()
+
     async def __fetch_share_detail(self, share_id):
-        url = self.api_prefix + '/api/share/{}'.format(share_id)
+        url = self.__get_api_prefix() + '/api/share/{}'.format(share_id)
 
         async with httpx.AsyncClient(proxies=self.proxy, timeout=30) as client:
             response = await client.get(url)
@@ -129,7 +156,7 @@ class ChatBot:
         return resp
 
     async def login(self):
-        return render_template('login.html', api_prefix=self.api_prefix, next=request.args.get('next', ''))
+        return render_template('login.html', api_prefix=self.__get_api_prefix(), next=request.args.get('next', ''))
 
     async def login_post(self):
         username = request.form.get('username')
@@ -151,7 +178,26 @@ class ChatBot:
             except Exception as e:
                 error = str(e)
 
-        return render_template('login.html', username=username, error=error, api_prefix=self.api_prefix)
+        return render_template('login.html', username=username, error=error, api_prefix=self.__get_api_prefix())
+
+    async def login_share_token(self):
+        share_token = request.args.get('token')
+        error = None
+
+        if share_token and share_token.startswith('fk-'):
+            try:
+                ti = await self.__fetch_share_tokeninfo(share_token)
+                payload = {'exp': ti['expire_at']}
+
+                resp = make_response('please wait...', 307)
+                resp.headers.set('Location', '/')
+                self.__set_cookie(resp, share_token, payload['exp'])
+
+                return resp
+            except Exception as e:
+                error = str(e)
+
+        return render_template('login.html', error=error, api_prefix=self.__get_api_prefix())
 
     async def login_token(self):
         access_token = request.form.get('access_token')
@@ -161,6 +207,9 @@ class ChatBot:
         if access_token:
             try:
                 payload = check_access_token(access_token)
+                if True == payload:
+                    ti = await self.__fetch_share_tokeninfo(access_token)
+                    payload = {'exp': ti['expire_at']}
 
                 resp = jsonify({'code': 0, 'url': next_url if next_url else '/'})
                 self.__set_cookie(resp, access_token, payload['exp'])
@@ -178,7 +227,7 @@ class ChatBot:
 
         query = request.args.to_dict()
         if conversation_id:
-            query['chatId'] = conversation_id
+            query['default'] = ['c', conversation_id]
 
         props = {
             'props': {
@@ -202,7 +251,7 @@ class ChatBot:
                 },
                 '__N_SSP': True
             },
-            'page': '/c/[chatId]' if conversation_id else '/',
+            'page': '/[[...default]]',
             'query': query,
             'buildId': self.__build_id,
             'isFallback': False,
@@ -211,7 +260,7 @@ class ChatBot:
         }
 
         template = 'detail.html' if conversation_id else 'chat.html'
-        return render_template(template, pandora_sentry=self.sentry, api_prefix=self.api_prefix, props=props)
+        return render_template(template, api_prefix=self.__get_api_prefix(), props=props)
 
     async def session(self):
         err, user_id, email, access_token, payload = await self.__get_userinfo()
@@ -234,6 +283,21 @@ class ChatBot:
 
         return jsonify(ret)
 
+    async def error404(self, e):
+        props = {
+            'props': {
+                'pageProps': {'statusCode': 404}
+            },
+            'page': '/_error',
+            'query': {},
+            'buildId': self.__build_id,
+            'nextExport': True,
+            'isFallback': False,
+            'gip': True,
+            'scriptLoader': []
+        }
+        return render_template('404.html', api_prefix=self.__get_api_prefix(), props=props)
+
     async def share_detail(self, share_id):
         err, user_id, email, _, _ = await self.__get_userinfo()
         if err:
@@ -254,7 +318,7 @@ class ChatBot:
                 'gip': True,
                 'scriptLoader': []
             }
-            return render_template('404.html', pandora_sentry=self.sentry, api_prefix=self.api_prefix, props=props)
+            return render_template('404.html', api_prefix=self.__get_api_prefix(), props=props)
 
         if 'continue_conversation_url' in share_detail:
             share_detail['continue_conversation_url'] = share_detail['continue_conversation_url'].replace(
@@ -284,7 +348,7 @@ class ChatBot:
             'scriptLoader': []
         }
 
-        return render_template('share.html', pandora_sentry=self.sentry, api_prefix=self.api_prefix, props=props)
+        return render_template('share.html', api_prefix=self.__get_api_prefix(), props=props)
 
     @staticmethod
     async def share_continue(share_id):
@@ -317,7 +381,7 @@ class ChatBot:
         return jsonify(props)
 
     async def share_continue_info(self, share_id):
-        err, user_id, email, access_token, _ = await self.__get_userinfo()
+        err, user_id, email, _, _ = await self.__get_userinfo()
         if err:
             return jsonify({
                 'pageProps': {
@@ -412,61 +476,89 @@ class ChatBot:
 
     @staticmethod
     async def check():
+        account_info = {
+            'account': {
+                'account_user_role': 'account-owner',
+                'account_user_id': 'd0322341-7ace-4484-b3f7-89b03e82b927',
+                'processor': {
+                    'a001': {
+                        'has_customer_object': True
+                    },
+                    'b001': {
+                        'has_transaction_history': False
+                    },
+                    'c001': {
+                        'has_transaction_history': False
+                    },
+                },
+                'account_id': 'a323bd05-db25-4e8f-9173-2f0c228cc8fa',
+                'is_most_recent_expired_subscription_gratis': False,
+                'has_previously_paid_subscription': True,
+                'name': None,
+                'structure': 'personal',
+            },
+            'features': [
+                'model_switcher',
+                "model_switcher_upsell",
+                'priority_driven_models_list',
+                'message_style_202305',
+                'layout_may_2023',
+                'plugins_available',
+                'beta_features',
+                'browsing_publisher_red_team',
+                'browsing_inner_monologue',
+                'new_plugin_oauth_endpoint',
+                'code_interpreter_available',
+                'chat_preferences_available',
+                'plugin_review_tools',
+                'message_debug_info',
+                "allow_url_thread_creation",
+                "persist_last_used_model",
+                "allow_continue",
+                "user_latency_tools",
+                "share_multimodal_links",
+                "starter_prompts",
+                'shareable_links',
+                'tools3_dev',
+                'tools2',
+                'debug',
+                "ks",
+            ],
+            'entitlement': {
+                'subscription_id': 'd0dcb1fc-56aa-4cd9-90ef-37f1e03576d3',
+                'has_active_subscription': True,
+                'subscription_plan': 'chatgptplusplan',
+                'expires_at': '2089-08-08T23:59:59+00:00'
+            },
+            'last_active_subscription': {
+                'subscription_id': 'd0dcb1fc-56aa-4cd9-90ef-37f1e03576d3',
+                'purchase_origin_platform': 'chatgpt_web',
+                'will_renew': True
+            }
+        }
+
         ret = {
             'accounts': {
-                'default': {
-                    'account': {
-                        'account_user_role': 'account-owner',
-                        'account_user_id': 'd0322341-7ace-4484-b3f7-89b03e82b927',
-                        'processor': {
-                            'a001': {
-                                'has_customer_object': True
-                            },
-                            'b001': {
-                                'has_transaction_history': True
-                            }
-                        },
-                        'account_id': 'a323bd05-db25-4e8f-9173-2f0c228cc8fa',
-                        'is_most_recent_expired_subscription_gratis': True,
-                        'has_previously_paid_subscription': True
-                    },
-                    'features': [
-                        'model_switcher',
-                        'model_preview',
-                        'system_message',
-                        'data_controls_enabled',
-                        'data_export_enabled',
-                        'show_existing_user_age_confirmation_modal',
-                        'bucketed_history',
-                        'priority_driven_models_list',
-                        'message_style_202305',
-                        'layout_may_2023',
-                        'plugins_available',
-                        'beta_features',
-                        'infinite_scroll_history',
-                        'browsing_available',
-                        'browsing_inner_monologue',
-                        'browsing_bing_branding',
-                        'shareable_links',
-                        'plugin_display_params',
-                        'tools3_dev',
-                        'tools2',
-                        'debug',
-                    ],
-                    'entitlement': {
-                        'subscription_id': 'd0dcb1fc-56aa-4cd9-90ef-37f1e03576d3',
-                        'has_active_subscription': True,
-                        'subscription_plan': 'chatgptplusplan',
-                        'expires_at': '2089-08-08T23:59:59+00:00'
-                    },
-                    'last_active_subscription': {
-                        'subscription_id': 'd0dcb1fc-56aa-4cd9-90ef-37f1e03576d3',
-                        'purchase_origin_platform': 'chatgpt_mobile_ios',
-                        'will_renew': True
-                    }
-                }
+                'a323bd05-db25-4e8f-9173-2f0c228cc8fa': account_info,
+                'default': account_info,
             },
-            'temp_ap_available_at': '2023-05-20T17:30:00+00:00'
+            'account_ordering': [
+                'a323bd05-db25-4e8f-9173-2f0c228cc8fa'
+            ],
         }
 
         return jsonify(ret)
+
+    @staticmethod
+    async def csrf():
+        return jsonify({
+            'csrfToken': 'ca8a67e09fc1b14d5146184efeeeb7e42dd247e1772e1f728e6e802cbcfe414e',
+        })
+
+    async def sign_out(self):
+        resp = jsonify({
+            'url': request.args.get('callbackUrl', url_for('login')),
+        })
+        self.__set_cookie(resp, '', 0)
+
+        return resp
